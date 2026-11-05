@@ -33,7 +33,6 @@ $serverArgs = @(
     '-m', $target, '-md', $draft,
     '--alias', $ModelAlias,
     '--spec-type', 'draft-dspark',
-    '--spec-draft-sampling', 'greedy',
     '--spec-draft-n-max', '7',
     '--spec-draft-p-min', '0',
     '-ngl', '999', '-ngld', '999',
