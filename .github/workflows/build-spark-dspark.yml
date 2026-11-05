@@ -1,0 +1,181 @@
+name: Build Spark DSpark - Windows CUDA 12.4
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/build-spark-dspark.yml'
+      - 'dspark/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'src/**'
+      - 'ggml/**'
+      - 'common/**'
+      - 'tools/server/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spark-dspark-release
+  cancel-in-progress: false
+
+jobs:
+  windows-cuda:
+    name: Windows x64 / CUDA 12.4 / SM 89 (RTX 4090)
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout DSpark-enabled fork
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Record precise source revision
+        id: revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-f]{40}$') { throw 'Invalid source commit SHA' }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "Building $sha"
+
+      - name: Install CUDA 12.4 with the source repository's setup action
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+          cuda_arch: 'x64'
+
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          choco install ninja -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Ninja installation failed' }
+          nvcc --version
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA toolkit unavailable' }
+
+      - name: Configure and compile llama-server with CUDA
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+          cmake -S . -B build-dspark -G "Ninja Multi-Config" ^
+            -DGGML_CUDA=ON ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DCMAKE_CUDA_ARCHITECTURES=89 ^
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3 ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_SERVER=ON
+          if errorlevel 1 exit /b 1
+          cmake --build build-dspark --config Release --target llama-server ggml-cuda ggml-cpu --parallel 3
+          if errorlevel 1 exit /b 1
+
+      - name: Collect binaries and verify DSpark support
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ steps.revision.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Join-Path $PWD 'build-dspark\bin\Release'
+          $stage = Join-Path $PWD 'dist\spark-dspark-win-x64-cuda12.4-sm89'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $stage 'models') -Force | Out-Null
+
+          if (-not (Test-Path (Join-Path $bin 'llama-server.exe'))) {
+            throw "Missing llama-server.exe in $bin"
+          }
+          Get-ChildItem -Path $bin -File |
+            Where-Object { $_.Extension -in @('.exe', '.dll') } |
+            Copy-Item -Destination $stage -Force
+
+          foreach ($name in @('ggml-cuda.dll', 'ggml-cpu.dll')) {
+            if (-not (Test-Path (Join-Path $stage $name))) { throw "Missing compiled backend: $name" }
+          }
+
+          # These are CUDA 12 redistributable runtime libraries. The NVIDIA
+          # display driver (nvcuda.dll) must be installed on the user machine.
+          $cudaBin = Join-Path $env:CUDA_PATH 'bin'
+          foreach ($name in @('cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll')) {
+            $dll = Join-Path $cudaBin $name
+            if (-not (Test-Path $dll)) { throw "Missing CUDA redistributable: $dll" }
+            Copy-Item -LiteralPath $dll -Destination $stage -Force
+          }
+
+          Copy-Item LICENSE (Join-Path $stage 'llama.cpp-LICENSE.txt')
+          Copy-Item dspark\*.ps1 $stage -Force
+          Copy-Item dspark\*.cmd $stage -Force
+          Copy-Item dspark\README.md (Join-Path $stage 'README.md')
+          $eula = Join-Path $env:CUDA_PATH 'EULA.txt'
+          if (Test-Path $eula) { Copy-Item $eula (Join-Path $stage 'NVIDIA-CUDA-EULA.txt') }
+          Set-Content -Path (Join-Path $stage 'SOURCE-REVISION.txt') -Encoding ascii -Value @(
+            'Source: https://github.com/BoQsc/llama.cpp',
+            "Commit: $env:SOURCE_SHA",
+            'CUDA: 12.4',
+            'GPU: NVIDIA SM 89 (RTX 4090)',
+            'Model weights not included.'
+          )
+          Set-Content -Path (Join-Path $stage 'models\PLACE_GGUF_FILES_HERE.txt') -Value @(
+            'Spark-target.gguf  = matching Spark-X2.6-4B GGUF target model',
+            'Spark-draft.gguf   = Spark-X2.6-4B DSpark GGUF draft model'
+          )
+
+          $server = Join-Path $stage 'llama-server.exe'
+          $help = (& $server --help 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw "llama-server --help failed: $help" }
+          if ($help -notmatch 'draft-dspark') { throw 'DSpark CLI support is missing. Refusing to publish.' }
+          Write-Host 'Verified: --spec-type draft-dspark is available.'
+
+      - name: Package ZIP
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ steps.revision.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = 'spark-dspark-win-x64-cuda12.4-sm89.zip'
+          Compress-Archive -Path 'dist\spark-dspark-win-x64-cuda12.4-sm89\*' -DestinationPath $zip -CompressionLevel Optimal -Force
+          if (-not (Test-Path $zip)) { throw 'ZIP packaging failed' }
+          @"
+          DSpark-enabled llama.cpp for Windows x64 / NVIDIA RTX 4090 (SM 89), CUDA 12.4.
+
+          Source: https://github.com/BoQsc/llama.cpp
+          Commit: $env:SOURCE_SHA
+
+          Download the ZIP, extract, place the matching Spark target and DSpark draft GGUF models
+          in models/, then run start-dspark.cmd. The local OpenAI-compatible API is at
+          http://127.0.0.1:8080/v1 (model id: spark-dspark).
+
+          The ZIP includes llama-server.exe, accompanying DLLs, CUDA runtime DLLs and launch scripts.
+          It does not include model weights or an NVIDIA display driver.
+
+          CI checks compilation and that the binary advertises DSpark. CUDA GPU inference
+          cannot be tested on the GitHub-hosted Windows runner.
+          "@ | Set-Content -Path release-notes.txt -Encoding utf8
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spark-dspark-win-x64-cuda12.4-sm89
+          path: spark-dspark-win-x64-cuda12.4-sm89.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release with downloadable ZIP
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = 'dspark-build-${{ github.run_number }}'
+          gh release create $tag 'spark-dspark-win-x64-cuda12.4-sm89.zip' `
+            --repo '${{ github.repository }}' `
+            --target '${{ github.sha }}' `
+            --title 'Spark DSpark - Windows CUDA 12.4 - Build ${{ github.run_number }}' `
+            --notes-file 'release-notes.txt' `
+            --latest
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release publishing failed' }
